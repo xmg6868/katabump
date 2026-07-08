@@ -78,7 +78,6 @@ async function sendTelegramMessage(message, imagePath = null) {
 chromium.use(stealth);
 
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
-const CDP_HOST = process.env.CDP_HOST || '127.0.0.1';
 const DEBUG_PORT = 9222;
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 720;
@@ -86,9 +85,10 @@ const RENEW_MAX_ATTEMPTS = 3;
 process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
+const SUB_URL = process.env.SUB_URL;
 let PROXY_CONFIG = null;
 
-if (HTTP_PROXY) {
+if (HTTP_PROXY && !SUB_URL) {
     try {
         const proxyUrl = new URL(HTTP_PROXY);
         PROXY_CONFIG = {
@@ -179,7 +179,7 @@ async function checkProxy() {
 
 function checkPort(port) {
     return new Promise((resolve) => {
-        const req = http.get(`http://${CDP_HOST}:${port}/json/version`, (res) => {
+        const req = http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
             res.resume();
             resolve(true);
         });
@@ -192,12 +192,19 @@ function checkPort(port) {
 }
 
 async function launchChrome() {
+    let executablePath = CHROME_PATH;
+    if (!fs.existsSync(executablePath)) {
+        try {
+            const pw = require('playwright');
+            executablePath = pw.chromium.executablePath();
+        } catch (e) {}
+    }
     console.log('检查 Chrome 是否已在端口 ' + DEBUG_PORT + ' 上运行...');
     if (await checkPort(DEBUG_PORT)) {
         console.log('Chrome 已开启。');
         return;
     }
-    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+    console.log(`正在启动 Chrome (路径: ${executablePath})...`);
     const args = [
         `--remote-debugging-port=${DEBUG_PORT}`,
         '--no-first-run',
@@ -206,16 +213,24 @@ async function launchChrome() {
         `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--user-data-dir=/tmp/chrome_user_data',
+        `--user-data-dir=/tmp/chrome_user_data_${Date.now()}`,
         '--disable-dev-shm-usage'
     ];
-    if (PROXY_CONFIG) {
+    if (process.env.SUB_URL) {
+        args.push('--proxy-server=http://127.0.0.1:7890');
+        args.push('--proxy-bypass-list=<-loopback>');
+    } else if (PROXY_CONFIG) {
         args.push(`--proxy-server=${PROXY_CONFIG.server}`);
         args.push('--proxy-bypass-list=<-loopback>');
     }
-    const chrome = spawn(CHROME_PATH, args, {
+    const errLogPath = path.join(process.cwd(), 'chrome_err.log');
+    const errStream = fs.openSync(errLogPath, 'w');
+    const chrome = spawn(executablePath, args, {
         detached: true,
-        stdio: 'ignore'
+        stdio: ['ignore', 'ignore', errStream]
+    });
+    chrome.on('error', (err) => {
+        console.error('Chrome spawn error:', err);
     });
     chrome.unref();
     console.log('正在等待 Chrome 初始化...');
@@ -224,6 +239,10 @@ async function launchChrome() {
         await new Promise(r => setTimeout(r, 1000));
     }
     if (!await checkPort(DEBUG_PORT)) {
+        try {
+            const errLog = fs.readFileSync(errLogPath, 'utf8');
+            console.error('Chrome 启动报错信息:\n', errLog);
+        } catch (e) {}
         throw new Error('Chrome 启动失败');
     }
 }
@@ -673,6 +692,162 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 }
 
 // ==========================================
+// ========== 3. Mihomo 代理池专区 ==============
+// ==========================================
+async function setupMihomo(subUrl) {
+    const { execSync, spawn } = require('child_process');
+    
+    console.log('[代理池] 检测到 SUB_URL，准备下载和启动 Mihomo...');
+    const mihomoPath = path.join(process.cwd(), 'mihomo');
+    if (!fs.existsSync(mihomoPath)) {
+        try {
+            console.log('[代理池] 下载 mihomo-linux-amd64...');
+            execSync('curl -L -o mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.18.9/mihomo-linux-amd64-v1.18.9.gz');
+            execSync('gzip -d mihomo.gz');
+            execSync('chmod +x mihomo');
+        } catch (e) {
+            console.error('[代理池] 下载 Mihomo 失败:', e.message);
+            return false;
+        }
+    }
+    
+const configYaml = `
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: debug
+external-controller: 127.0.0.1:9090
+proxy-providers:
+  sub1:
+    type: http
+    url: "${subUrl}"
+    interval: 3600
+    path: ./sub1.yaml
+    headers:
+      User-Agent: ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"]
+    health-check:
+      enable: true
+      interval: 600
+      url: http://www.gstatic.com/generate_204
+
+proxy-groups:
+  - name: MyGroup
+    type: select
+    use:
+      - sub1
+rules:
+  - MATCH,MyGroup
+`;
+    fs.writeFileSync('config.yaml', configYaml, 'utf8');
+    
+    console.log('[代理池] 正在验证 Mihomo 二进制文件...');
+    try {
+        const versionOutput = execSync(`${mihomoPath} -v`).toString();
+        console.log('[代理池] Mihomo 版本信息:\n', versionOutput);
+    } catch (e) {
+        console.error('[代理池] Mihomo 二进制文件无法执行:', e.message);
+        if (e.stdout) console.error(e.stdout.toString());
+        if (e.stderr) console.error(e.stderr.toString());
+    }
+
+    console.log('[代理池] 正在测试 config.yaml 语法...');
+    try {
+        const testOutput = execSync(`${mihomoPath} -d ${process.cwd()} -f config.yaml -t`).toString();
+        console.log('[代理池] config.yaml 测试结果:\n', testOutput);
+    } catch (e) {
+        console.error('[代理池] config.yaml 语法错误:', e.message);
+        if (e.stdout) console.error(e.stdout.toString());
+        if (e.stderr) console.error(e.stderr.toString());
+    }
+
+    const mihomoProc = spawn(mihomoPath, ['-d', process.cwd(), '-f', 'config.yaml'], {
+        detached: true
+    });
+    mihomoProc.stdout.on('data', data => fs.appendFileSync('mihomo.log', data));
+    mihomoProc.stderr.on('data', data => fs.appendFileSync('mihomo.log', data));
+    mihomoProc.on('error', err => {
+        fs.appendFileSync('mihomo.log', `[SPAWN ERROR] ${err.message}\n`);
+    });
+    mihomoProc.on('exit', (code, signal) => {
+        fs.appendFileSync('mihomo.log', `[EXIT] code=${code} signal=${signal}\n`);
+    });
+    mihomoProc.unref();
+    console.log('[代理池] 正在启动 Mihomo 代理引擎 (5秒)...');
+    await new Promise(r => setTimeout(r, 5000));
+    return true;
+}
+
+async function getMihomoProxies() {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const res = await axios.get('http://127.0.0.1:9090/proxies/MyGroup');
+            const all = res.data.all || [];
+            const filtered = all.filter(name => name !== 'DIRECT' && name !== 'REJECT' && name !== 'MyGroup');
+            
+            if (filtered.length > 0) {
+                return filtered;
+            }
+            
+            console.log(`[代理池] 尝试 ${attempt}: 节点数为0，等待 3 秒后重试...`);
+            await new Promise(r => setTimeout(r, 3000));
+        } catch (e) {
+            console.error(`[代理池] 获取代理列表失败 (尝试 ${attempt}):`, e.message);
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+    
+    console.error('[代理池] 警告：多次尝试后提取到的节点数依然为0！');
+    try {
+        const subContent = fs.readFileSync(path.join(process.cwd(), 'sub1.yaml'), 'utf8');
+        console.error('[代理池] sub1.yaml 下载内容前 500 字符:\n', subContent.substring(0, 500));
+    } catch(e) {
+        console.error('[代理池] 无法读取 sub1.yaml，可能尚未下载完成或下载失败。');
+    }
+    
+    try {
+        const logContent = fs.readFileSync(path.join(process.cwd(), 'mihomo.log'), 'utf8');
+        console.error('[代理池] Mihomo 运行日志:\n', logContent);
+    } catch (err) {}
+    
+    return [];
+}
+
+async function testMihomoProxies(proxyNames) {
+    console.log(`[代理池] 开始对 ${proxyNames.length} 个节点进行测速 (并发请求)...`);
+    const healthy = [];
+    const BATCH = 15;
+    for (let i = 0; i < proxyNames.length; i += BATCH) {
+        const batch = proxyNames.slice(i, i + BATCH);
+        const promises = batch.map(async name => {
+            try {
+                const res = await axios.get(`http://127.0.0.1:9090/proxies/${encodeURIComponent(name)}/delay?timeout=3000&url=http://www.gstatic.com/generate_204`, { timeout: 4000 });
+                if (res.data && res.data.delay) {
+                    return { name, delay: res.data.delay };
+                }
+            } catch (e) {}
+            return null;
+        });
+        const results = await Promise.all(promises);
+        for (const r of results) {
+            if (r) healthy.push(r.name);
+        }
+    }
+    console.log(`[代理池] 测速完成，健康节点数量: ${healthy.length}`);
+    return healthy;
+}
+
+async function switchMihomoProxy(name) {
+    try {
+        await axios.put('http://127.0.0.1:9090/proxies/MyGroup', { name }, { timeout: 2000 });
+        console.log(`[代理池] 🚀 成功切换节点: ${name}`);
+        return true;
+    } catch (e) {
+        console.error(`[代理池] ❌ 切换节点 ${name} 失败:`, e.message);
+        return false;
+    }
+}
+
+// ==========================================
 // =============== 主循环执行 =================
 // ==========================================
 (async () => {
@@ -685,8 +860,35 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
     const renewDates = loadRenewDates();
     let accountDatesInfo = {};
 
-    if (PROXY_CONFIG) {
+    if (PROXY_CONFIG && !SUB_URL) {
         if (!await checkProxy()) process.exit(1);
+    }
+    
+    let proxyPool = [];
+    let proxyIndex = 0;
+    let proxyStats = { total: 0, healthy: 0, invalid: 0 };
+
+    if (SUB_URL) {
+        const started = await setupMihomo(SUB_URL);
+        if (started) {
+            console.log('[代理池] 正在刷新 provider...');
+            await axios.put('http://127.0.0.1:9090/providers/proxies/sub1').catch(()=>{});
+            await new Promise(r => setTimeout(r, 2000));
+            const proxies = await getMihomoProxies();
+            proxyStats.total = proxies.length;
+            if (proxies.length > 0) {
+                proxyPool = await testMihomoProxies(proxies);
+                proxyStats.healthy = proxyPool.length;
+                proxyStats.invalid = proxyStats.total - proxyStats.healthy;
+            } else {
+                console.log('[代理池] 没有找到任何节点，可能是订阅链接格式不支持或下载失败。');
+            }
+            if (proxyPool.length === 0) {
+                console.log('[代理池] 警告：没有找到可用的健康节点，将使用默认网络。');
+            } else {
+                proxyPool.sort(() => Math.random() - 0.5);
+            }
+        }
     }
 
     await launchChrome();
@@ -695,7 +897,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
     let browser;
     for (let k = 0; k < 5; k++) {
         try {
-            browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${DEBUG_PORT}`);
+            browser = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUG_PORT}`);
             console.log('连接成功！');
             break;
         } catch (e) {
@@ -711,12 +913,9 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
         await browser.close();
         process.exit(1);
     }
-    let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
-    page.setDefaultTimeout(60000);
-    await configurePageViewport(page);
 
     // --- 代理认证处理 ---
-    if (PROXY_CONFIG && PROXY_CONFIG.username) {
+    if (PROXY_CONFIG && PROXY_CONFIG.username && !SUB_URL) {
         console.log('[代理] 设置认证拦截...');
         await context.route('**/*', (route) => {
             route.continue({
@@ -728,68 +927,90 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
         });
     }
 
-    await page.addInitScript(INJECTED_SCRIPT);
+    // Create a dummy page to keep Chrome alive when other pages are closed
+    const dummyPage = await context.newPage();
+    for (const p of context.pages()) {
+        if (p !== dummyPage) {
+            await p.close().catch(()=>{});
+        }
+    }
 
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
-
+        
         const dedupeKey = user.username.toLowerCase();
         let nextDateStr = renewDates[dedupeKey];
         if (nextDateStr) {
             let nextDate = new Date(nextDateStr);
             if (!isNaN(nextDate.getTime())) {
                 if (Date.now() < nextDate.getTime()) {
+                    let daysLeft = Math.ceil((nextDate.getTime() - Date.now()) / (1000 * 3600 * 24));
                     console.log(`[跳过] 账号 ${user.username} 还没到可续期时间，下次可续期: ${nextDateStr}`);
                     stats.skipped++;
-                    accountDatesInfo[user.username] = nextDateStr;
+                    accountDatesInfo[user.username] = {
+                        status: "⏳ 时间未到",
+                        nextDate: nextDateStr,
+                        daysLeft: daysLeft,
+                        node: "N/A"
+                    };
                     continue;
                 }
             }
         }
 
-        try {
-            if (page.isClosed()) {
+        let accountSuccess = false;
+        let accountFailureReason = "未知错误";
+        const maxAttempts = (SUB_URL && proxyPool.length > 1) ? 3 : 1;
+        let page = null;
+        let usedNode = 'DIRECT';
+        
+        for (let accountAttempt = 1; accountAttempt <= maxAttempts; accountAttempt++) {
+            if (accountAttempt > 1) {
+                console.log(`\n[重试] 账号 ${maskUsernameForLog(user.username)} 第 ${accountAttempt} 次尝试...`);
+            }
+            
+            if (proxyPool.length > 0) {
+                const nodeName = proxyPool[proxyIndex % proxyPool.length];
+                usedNode = nodeName;
+                proxyIndex++;
+                await switchMihomoProxy(nodeName);
+                await new Promise(r => setTimeout(r, 1000));
+            }
+
+            try {
+                if (page && !page.isClosed()) {
+                    await page.close().catch(()=>{});
+                }
+                
+                await context.clearCookies();
                 page = await context.newPage();
+                page.setDefaultTimeout(60000);
+                await configurePageViewport(page);
                 await page.addInitScript(INJECTED_SCRIPT);
-            }
 
-            // 1. 先确保已登出，再访问登录页
-            console.log('确保已登出...');
-            if (page.url().includes('dashboard')) {
-                await page.goto('https://dashboard.katabump.com/auth/logout');
-                await page.waitForTimeout(2000);
-            }
-            await page.goto('https://dashboard.katabump.com/auth/login');
-            await page.waitForTimeout(2000);
-
-            // 如果访问登录页后被重定向到 dashboard，说明还有 session，先 logout
-            if (page.url().includes('dashboard') && !page.url().includes('login')) {
-                console.log('Session 仍然有效，正在登出...');
-                await page.goto('https://dashboard.katabump.com/auth/logout');
-                await page.waitForTimeout(2000);
+                console.log('正在访问登录页...');
                 await page.goto('https://dashboard.katabump.com/auth/login');
                 await page.waitForTimeout(2000);
-            }
+                
+                const loginTurnstileOk = await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
+                if (!loginTurnstileOk) {
+                    console.log('   >> 登录阶段 Turnstile 验证失败，切换节点重试');
+                    accountFailureReason = "登录阶段防火墙拦截";
+                    continue; // 触发节点重试
+                }
 
-            await page.waitForTimeout(3000); 
-
-            // ➡️ 【登录阶段专属】：解决 Turnstile
-            await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
-
-            console.log('正在输入凭据...');
-            try {
+                console.log('正在输入凭据...');
                 const emailInput = page.getByRole('textbox', { name: 'Email' });
                 await emailInput.waitFor({ state: 'visible', timeout: 5000 });
                 await emailInput.fill(user.username);
-
+                
                 const pwdInput = page.getByRole('textbox', { name: 'Password' });
                 await pwdInput.fill(user.password);
-
+                
                 await page.waitForTimeout(500);
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
-                // 检查登录错误
                 try {
                     const errorMsg = page.getByText('Incorrect password or no account');
                     if (await errorMsg.isVisible({ timeout: 3000 })) {
@@ -802,235 +1023,266 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
                         stats.failed++;
                         stats.failedAccounts.push(user.username);
-                        accountDatesInfo[user.username] = "❌ 登录失败";
-                        continue;
+                        accountDatesInfo[user.username] = {
+                            status: "❌ 登录失败",
+                            nextDate: "未知",
+                            daysLeft: "未知",
+                            node: usedNode
+                        };
+                        accountSuccess = true; // Set true to break out of outer loop since password is wrong
+                        break;
                     }
                 } catch (e) { }
 
-            } catch (e) {
-                console.log('登录操作遇到异常 (可能是已经登录或超时):', e.message);
-            }
-
-            // 2. 登录后的操作
-            if (user.serverId) {
-                console.log(`正在通过 Server ID (${user.serverId}) 直接访问续期页面...`);
-                await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`);
-                await page.waitForTimeout(3000);
-            } else {
-                console.log('未配置 Server ID，正在寻找 "See" 链接...');
-                try {
-                    await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
-                    await page.waitForTimeout(1000);
-                    await page.getByRole('link', { name: 'See' }).first().click();
-                } catch (e) {
-                    console.log('未找到 "See" 按钮 (可能登录未成功或界面变动)。');
-                    continue;
-                }
-            }
-
-            // 3. Renew 逻辑
-            let renewSuccess = false;
-            let renewFailureReason = `续期失败，${RENEW_MAX_ATTEMPTS}次尝试均未成功`;
-            for (let attempt = 1; attempt <= RENEW_MAX_ATTEMPTS; attempt++) {
-                if (page.url().includes('login')) {
-                    console.log('页面被重定向到登录页，退出 Renew 循环。');
-                    break;
-                }
-
-                console.log(`\n[尝试 ${attempt}/${RENEW_MAX_ATTEMPTS}] 正在寻找 Renew 按钮...`);
-                const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
-
-                try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
-
-                if (await renewBtn.isVisible()) {
-                    await renewBtn.click();
-                    console.log('Renew 按钮已点击。等待模态框...');
-
-                    // 定位弹窗
-                    const modal = page.locator('.modal-content, [role="dialog"]').filter({ hasText: 'Renew' }).first();
-
-                    try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {
-                        console.log('模态框未出现？重试中...');
+                if (user.serverId) {
+                    console.log(`正在通过 Server ID (${user.serverId}) 直接访问续期页面...`);
+                    await page.goto(`https://dashboard.katabump.com/servers/edit?id=${user.serverId}`);
+                    await page.waitForTimeout(3000);
+                } else {
+                    console.log('未配置 Server ID，正在寻找 "See" 链接...');
+                    try {
+                        await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
+                        await page.waitForTimeout(1000);
+                        await page.getByRole('link', { name: 'See' }).first().click();
+                    } catch (e) {
+                        console.log('未找到 "See" 按钮 (可能登录未成功或网络断开)。');
+                        accountFailureReason = "找不到 See 按钮，可能节点被阻断";
                         continue;
                     }
+                }
 
-                    // 晃动鼠标
-                    try {
-                        const box = await modal.boundingBox();
-                        if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
-                    } catch (e) { }
+                let renewPhaseSuccess = false;
+                for (let attempt = 1; attempt <= RENEW_MAX_ATTEMPTS; attempt++) {
+                    if (page.url().includes('login')) {
+                        console.log('页面被重定向到登录页，退出 Renew 循环。');
+                        break;
+                    }
 
-                    const confirmBtn = modal.getByRole('button', { name: 'Renew', exact: true });
-                    if (await confirmBtn.isVisible()) {
+                    console.log(`\n[尝试 ${attempt}/${RENEW_MAX_ATTEMPTS}] 正在寻找 Renew 按钮...`);
+                    const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+                    
+                    try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
 
-                        const photoDir = path.join(process.cwd(), 'screenshots');
-                        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const captchaScreenshotName = `${safeUsername}_ALTCHA_${attempt}.png`;
-                        try {
-                            await saveViewportScreenshot(page, path.join(photoDir, captchaScreenshotName));
-                            console.log(`   >> 弹窗截图已保存: ${captchaScreenshotName}`);
-                        } catch (e) {
-                            console.log('   >> 截图失败:', e.message);
-                        }
+                    if (await renewBtn.isVisible()) {
+                        await renewBtn.click();
+                        console.log('Renew 按钮已点击。等待模态框...');
 
-                        // ➡️ 【Renew阶段专属】：只处理 ALTCHA Captcha，给 8 秒等待它的 PoW 后台计算
-                        const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 15, 8000);
-
-                        if (!altchaOk) {
-                            renewFailureReason = `续期失败，Renew 阶段 ALTCHA 未通过（已重试 ${RENEW_MAX_ATTEMPTS} 次）`;
-                            console.log('   >> ALTCHA 未通过，跳过确认按钮并刷新重试...');
-                            await page.reload();
-                            await page.waitForTimeout(3000);
-                            if (page.url().includes('login')) {
-                                console.log('   >> 刷新后被重定向到登录页，退出。');
-                                break;
-                            }
+                        const modal = page.locator('.modal-content, [role="dialog"]').filter({ hasText: 'Renew' }).first();
+                        try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {
+                            console.log('模态框未出现？重试中...');
                             continue;
                         }
 
-                        console.log('   >> 点击弹窗中的 Renew 确认按钮...');
-                        await confirmBtn.click();
-
-                        let hasCaptchaError = false;
                         try {
-                            const startVerifyTime = Date.now();
-                            while (Date.now() - startVerifyTime < 3000) {
-                                if (await page.getByText('Please complete the captcha to continue').isVisible()) {
-                                    console.log('   >> ⚠️ 错误: "Please complete the captcha".');
-                                    hasCaptchaError = true;
-                                    break;
-                                }
-                                const notTimeLoc = page.getByText("You can't renew your server yet");
-                                if (await notTimeLoc.isVisible()) {
-                                    const text = await notTimeLoc.innerText().catch(() => '');
-                                    const match = text.match(/as of\s+(.*?)\s+\(/);
-                                    let dateStr = match ? match[1] : 'Unknown Date';
-                                    console.log(`   >> ⏳ 暂无法续期 (还没到时间)。下次可续期: ${dateStr}`);
-                                    renewSuccess = true;
-                                    stats.skipped++;
-
-                                    if (dateStr !== 'Unknown Date') {
-                                        renewDates[dedupeKey] = dateStr;
-                                        saveRenewDates(renewDates);
-                                    }
-                                    accountDatesInfo[user.username] = dateStr;
-
-                                    const skipScreenshot = path.join(photoDir, `${safeUsername}_skip.png`);
-                                    let modalClosed = false;
-                                    try {
-                                        const closeBtn = modal.getByLabel('Close');
-                                        if (await closeBtn.isVisible()) {
-                                            await closeBtn.click();
-                                            await modal.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
-                                            await page.waitForTimeout(500);
-                                            modalClosed = !await modal.isVisible().catch(() => false);
-                                        }
-                                    } catch (e) {}
-
-                                    if (!modalClosed) {
-                                        console.log('   >> Renew 弹窗未能完全关闭，使用当前页面状态截图。');
-                                    }
-
-                                    try { await saveViewportScreenshot(page, skipScreenshot); } catch (e) {}
-                                    await sendTelegramMessage(`⏳ *${escapeMarkdown(user.username)}*\n暂无法续期，下次可续期时间: ${dateStr}`, skipScreenshot);
-                                    break;
-                                }
-                                await page.waitForTimeout(200);
-                            }
+                            const box = await modal.boundingBox();
+                            if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                         } catch (e) { }
 
-                        if (renewSuccess) break;
+                        const confirmBtn = modal.getByRole('button', { name: 'Renew', exact: true });
+                        if (await confirmBtn.isVisible()) {
+                            
+                            const photoDir = path.join(process.cwd(), 'screenshots');
+                            if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+                            const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
+                            const captchaScreenshotName = `${safeUsername}_ALTCHA_${attempt}.png`;
+                            try {
+                                await saveViewportScreenshot(page, path.join(photoDir, captchaScreenshotName));
+                                console.log(`   >> 弹窗截图已保存: ${captchaScreenshotName}`);
+                            } catch (e) { }
+                            
+                            const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 15, 8000);
 
-                        if (hasCaptchaError) {
-                            renewFailureReason = `续期失败，Renew 阶段 ALTCHA 未通过（已重试 ${RENEW_MAX_ATTEMPTS} 次）`;
-                            console.log('   >> 验证码未通过，刷新页面重试...');
-                            await page.reload();
-                            await page.waitForTimeout(3000);
-                            if (page.url().includes('login')) {
-                                console.log('   >> 刷新后被重定向到登录页，退出。');
-                                break;
+                            if (!altchaOk) {
+                                console.log('   >> ALTCHA 未通过，跳过确认按钮并刷新重试...');
+                                await page.reload();
+                                await page.waitForTimeout(3000);
+                                if (page.url().includes('login')) break;
+                                continue;
                             }
-                            continue;
-                        }
 
-                        await page.waitForTimeout(2000);
-                        if (!await modal.isVisible()) {
-                            console.log('   >> ✅ Renew successful!');
-                            const successScreenshot = path.join(photoDir, `${safeUsername}_success.png`);
-                            try { await saveViewportScreenshot(page, successScreenshot); } catch (e) {}
-                            await sendTelegramMessage(`✅ *${escapeMarkdown(user.username)}*\n续期成功！`, successScreenshot);
-                            renewSuccess = true;
-                            stats.success++;
+                            console.log('   >> 点击弹窗中的 Renew 确认按钮...');
+                            await confirmBtn.click();
 
-                            delete renewDates[dedupeKey];
-                            saveRenewDates(renewDates);
-                            accountDatesInfo[user.username] = "✅ 刚刚成功";
+                            let hasCaptchaError = false;
+                            try {
+                                const startVerifyTime = Date.now();
+                                while (Date.now() - startVerifyTime < 3000) {
+                                    if (await page.getByText('Please complete the captcha to continue').isVisible()) {
+                                        console.log('   >> ⚠️ 错误: "Please complete the captcha".');
+                                        hasCaptchaError = true;
+                                        break;
+                                    }
+                                    const notTimeLoc = page.getByText("You can't renew your server yet");
+                                    if (await notTimeLoc.isVisible()) {
+                                        const text = await notTimeLoc.innerText().catch(() => '');
+                                        const match = text.match(/as of\s+(.*?)\s+\(/);
+                                        let dateStr = match ? match[1] : 'Unknown Date';
+                                        console.log(`   >> ⏳ 暂无法续期 (还没到时间)。下次可续期: ${dateStr}`);
+                                        renewPhaseSuccess = true;
+                                        stats.skipped++;
 
-                            break;
+                                        let daysLeft = '未知';
+                                        if (dateStr !== 'Unknown Date') {
+                                            renewDates[dedupeKey] = dateStr;
+                                            saveRenewDates(renewDates);
+                                            let currentYear = new Date().getFullYear();
+                                            let nextD = new Date(`${dateStr} ${currentYear}`);
+                                            if (!isNaN(nextD.getTime())) {
+                                                let diff = Math.ceil((nextD.getTime() - Date.now()) / (1000 * 3600 * 24));
+                                                if (diff < -180) {
+                                                    nextD = new Date(`${dateStr} ${currentYear + 1}`);
+                                                    diff = Math.ceil((nextD.getTime() - Date.now()) / (1000 * 3600 * 24));
+                                                }
+                                                daysLeft = diff;
+                                            }
+                                        }
+                                        accountDatesInfo[user.username] = {
+                                            status: "⏳ 时间未到",
+                                            nextDate: dateStr,
+                                            daysLeft: daysLeft,
+                                            node: usedNode
+                                        };
+
+                                        const skipScreenshot = path.join(photoDir, `${safeUsername}_skip.png`);
+                                        try { await saveViewportScreenshot(page, skipScreenshot); } catch (e) {}
+                                        await sendTelegramMessage(`⏳ *${escapeMarkdown(user.username)}*\n暂无法续期，下次可续期时间: ${dateStr}`, skipScreenshot);
+                                        break;
+                                    }
+                                    await page.waitForTimeout(200);
+                                }
+                            } catch (e) { }
+
+                            if (renewPhaseSuccess) break;
+
+                            if (hasCaptchaError) {
+                                console.log('   >> 验证码未通过，刷新页面重试...');
+                                await page.reload();
+                                await page.waitForTimeout(3000);
+                                if (page.url().includes('login')) break;
+                                continue;
+                            }
+
+                            await page.waitForTimeout(2000);
+                            if (!await modal.isVisible()) {
+                                console.log('   >> ✅ Renew successful!');
+                                const successScreenshot = path.join(photoDir, `${safeUsername}_success.png`);
+                                try { await saveViewportScreenshot(page, successScreenshot); } catch (e) {}
+                                await sendTelegramMessage(`✅ *${escapeMarkdown(user.username)}*\n续期成功！`, successScreenshot);
+                                renewPhaseSuccess = true;
+                                stats.success++;
+                                
+                                delete renewDates[dedupeKey];
+                                saveRenewDates(renewDates);
+                                accountDatesInfo[user.username] = {
+                                    status: "✅ 续期成功",
+                                    nextDate: "已续期(待下次更新)",
+                                    daysLeft: "约30",
+                                    node: usedNode
+                                };
+                                break;
+                            } else {
+                                console.log('   >> 模态框未关闭，刷新重试...');
+                                await page.reload();
+                                await page.waitForTimeout(3000);
+                                if (page.url().includes('login')) break;
+                                continue;
+                            }
                         } else {
-                            console.log('   >> 模态框未关闭，刷新重试...');
                             await page.reload();
                             await page.waitForTimeout(3000);
-                            if (page.url().includes('login')) {
-                                console.log('   >> 刷新后被重定向到登录页，退出。');
-                                break;
-                            }
+                            if (page.url().includes('login')) break;
                             continue;
                         }
                     } else {
-                        await page.reload();
-                        await page.waitForTimeout(3000);
-                        if (page.url().includes('login')) {
-                            console.log('   >> 刷新后被重定向到登录页，退出。');
-                            break;
-                        }
-                        continue;
+                        console.log('未找到 Renew 按钮 (可能已结束)。');
+                        break;
                     }
+                } 
+
+                if (renewPhaseSuccess) {
+                    accountSuccess = true;
+                    break; 
                 } else {
-                    console.log('未找到 Renew 按钮 (可能已结束)。');
-                    break;
+                    accountFailureReason = `续期操作未成功完成`;
+                    // Let the account retry loop continue and switch node
                 }
-            } 
 
-            if (!renewSuccess) {
-                console.log('   >> ❌ Renew 全部尝试失败。');
-                const failDir = path.join(process.cwd(), 'screenshots');
-                if (!fs.existsSync(failDir)) fs.mkdirSync(failDir, { recursive: true });
-                const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
-                const failScreenshot = path.join(failDir, `${failSafe}_renew_fail.png`);
-                try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
-                await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n${renewFailureReason}`, failScreenshot);
-                stats.failed++;
-                stats.failedAccounts.push(user.username);
-                accountDatesInfo[user.username] = "❌ 失败/需重试";
+            } catch (err) {
+                console.error(`处理用户环境遇到异常:`, err.message);
+                accountFailureReason = "网络异常或脚本报错";
             }
-
-        } catch (err) {
-            console.error(`Error processing user:`, err);
         }
 
-        const photoDir = path.join(process.cwd(), 'screenshots');
-        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
-        try {
-            await saveViewportScreenshot(page, path.join(photoDir, `${safeUsername}.png`));
-        } catch (e) {}
-
-        console.log(`用户处理完成\n`);
-    }
+        if (!accountSuccess && accountDatesInfo[user.username] !== "❌ 登录失败") {
+            console.log('   >> ❌ 账号全部重试失败。');
+            const failDir = path.join(process.cwd(), 'screenshots');
+            if (!fs.existsSync(failDir)) fs.mkdirSync(failDir, { recursive: true });
+            const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+            const failScreenshot = path.join(failDir, `${failSafe}_renew_fail.png`);
+            if (page && !page.isClosed()) {
+                try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
+            }
+            await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n${accountFailureReason} (已重试 ${maxAttempts} 次)`, failScreenshot);
+            stats.failed++;
+            stats.failedAccounts.push(user.username);
+            accountDatesInfo[user.username] = {
+                status: "❌ 操作失败",
+                nextDate: "未知",
+                daysLeft: "未知",
+                node: usedNode
+            };
+        }
+        
+        if (page && !page.isClosed()) {
+            const photoDir = path.join(process.cwd(), 'screenshots');
+            if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+            const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
+            try { await saveViewportScreenshot(page, path.join(photoDir, `${safeUsername}.png`)); } catch (e) {}
+            await page.close().catch(()=>{});
+        }
+    } // <-- Missing closing brace for the users loop added here
 
     // --- 发送最终汇总报告 ---
     let summaryMessage = `📊 *续期任务汇总报告*\n\n`;
+    
+    if (SUB_URL) {
+        summaryMessage += `🌐 *节点池统计*:\n`;
+        summaryMessage += `- 📥 拉取节点: ${proxyStats.total}\n`;
+        summaryMessage += `- ✅ 有效节点: ${proxyStats.healthy}\n`;
+        summaryMessage += `- ❌ 失效节点: ${proxyStats.invalid}\n\n`;
+    }
+
     summaryMessage += `🔹 总计账号: ${stats.total}\n`;
     summaryMessage += `✅ 成功续期: ${stats.success}\n`;
     summaryMessage += `⏳ 时间未到: ${stats.skipped}\n`;
     summaryMessage += `❌ 失败数量: ${stats.failed}\n\n`;
-
-    summaryMessage += `📅 *账号可签到日期详情*:\n`;
+    
+    summaryMessage += `📅 *账号详细信息*:\n`;
     users.forEach(user => {
-        let statusStr = accountDatesInfo[user.username] || renewDates[user.username.toLowerCase()] || "今日/未知";
-        summaryMessage += `- \`${escapeMarkdown(user.username)}\`: ${escapeMarkdown(statusStr)}\n`;
+        let info = accountDatesInfo[user.username];
+        if (!info) {
+             info = { status: "未知", nextDate: "未知", daysLeft: "未知", node: "未知" };
+             let rd = renewDates[user.username.toLowerCase()];
+             if (rd) {
+                 info.status = "⏳ 之前已成功";
+                 info.nextDate = rd;
+                 let currentYear = new Date().getFullYear();
+                 let nd = new Date(`${rd} ${currentYear}`);
+                 if (!isNaN(nd.getTime())) {
+                     let diff = Math.ceil((nd.getTime() - Date.now()) / (1000 * 3600 * 24));
+                     if (diff < -180) {
+                         nd = new Date(`${rd} ${currentYear + 1}`);
+                         diff = Math.ceil((nd.getTime() - Date.now()) / (1000 * 3600 * 24));
+                     }
+                     info.daysLeft = diff;
+                 }
+             }
+        }
+        
+        summaryMessage += `\n👤 \`${escapeMarkdown(user.username)}\`\n`;
+        summaryMessage += ` ├ 状态: ${info.status}\n`;
+        summaryMessage += ` ├ 节点: \`${escapeMarkdown(info.node)}\`\n`;
+        summaryMessage += ` └ 到期: ${escapeMarkdown(info.nextDate)} (剩 ${info.daysLeft} 天)\n`;
     });
 
     if (stats.failed > 0) {
@@ -1039,7 +1291,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
             summaryMessage += `- \`${escapeMarkdown(acc)}\`\n`;
         });
     }
-
+    
     await sendTelegramMessage(summaryMessage);
 
     console.log('完成。');
